@@ -1,0 +1,651 @@
+// %sparkdl.dep
+
+// To make this interpreter, we need to set up the following dependencies. Ideally, we do this from the interpreter menu, just recorded here for later analysis. 
+
+// z.load("org.nd4j:nd4j-native-platform:1.0.0-M2").exclude("org.scala-lang:*, org.apache.spark:*, org.apache*");
+// z.load("org.deeplearning4j:deeplearning4j-datasets:1.0.0-M2").exclude("org.scala-lang:*, org.apache.spark:*, org.apache*");
+// z.load("org.deeplearning4j:dl4j-spark3_2.12:1.0.0-M2").exclude("org.scala-lang:*, org.apache.spark:*, org.apache*");
+
+%sparkdl
+
+println("Scala version: " + scala.util.Properties.versionString);
+//println("Spark version: " + sc.version);
+println("Java version: " + System.getProperty("java.version"))
+%sparkdl
+
+// Pull in zounds of packages (we don't need all of them, but many of them.)
+import org.deeplearning4j.datasets.iterator.impl.MnistDataSetIterator;
+import org.deeplearning4j.eval.Evaluation;
+import org.deeplearning4j.nn.conf.MultiLayerConfiguration;
+import org.deeplearning4j.nn.conf.NeuralNetConfiguration;
+import org.deeplearning4j.nn.conf.inputs.InputType;
+import org.deeplearning4j.nn.conf.layers._; // N.B: .* -> ._
+import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
+import org.deeplearning4j.nn.weights.WeightInit;
+import org.deeplearning4j.optimize.listeners.ScoreIterationListener;
+import org.nd4j.linalg.activations.Activation;
+import org.nd4j.linalg.dataset.api.iterator.DataSetIterator;
+import org.nd4j.linalg.learning.config.Nesterovs;
+import org.nd4j.linalg.lossfunctions.LossFunctions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.deeplearning4j.spark.impl.multilayer._
+import org.deeplearning4j.spark.impl.paramavg.ParameterAveragingTrainingMaster;
+import org.deeplearning4j.spark.api.TrainingMaster;
+import org.nd4j.linalg.dataset.DataSet;
+import java.util.ArrayList;
+import org.apache.spark.api.java.JavaRDD;
+import scala.collection.JavaConversions._
+
+import java.util.HashMap;
+import java.util.Map;
+
+import org.deeplearning4j.spark.api.RDDTrainingApproach;
+import org.apache.spark.rdd.RDD;
+
+println("Scala version: " + scala.util.Properties.versionString);
+//println("Spark version: " + sc.version);
+println("Java version: " + System.getProperty("java.version"))
+%sparkdl
+sc.setLogLevel("INFO")
+
+// Not needed, also doesn't go onto the REPL, so not useful. 
+//val log : Logger = LoggerFactory.getLogger(classOf[MnistDataSetIterator]);
+
+val nChannels = 1; // Number of input channels
+val outputNum = 10; // The number of possible outcomes
+val batchSize = 64; // Test batch size
+val nEpochs = 1; // Number of training epochs
+val seed = 123; //
+
+
+val mnistTrain : DataSetIterator  = new MnistDataSetIterator(batchSize,true,12345);
+val mnistTest : DataSetIterator = new MnistDataSetIterator(batchSize,false,12345);
+
+val lrSchedule :  Map[Integer, Double] = new HashMap[Integer, Double]();
+lrSchedule.put(0, 0.01);
+lrSchedule.put(1000, 0.005);
+lrSchedule.put(3000, 0.001);
+val batchSizePerWorker = 16;
+%sparkdl
+def modelmetric(conf : MultiLayerConfiguration, mnistTrain : DataSetIterator,  mnistTest : DataSetIterator) {
+    val model = new MultiLayerNetwork(conf);
+    model.init();
+    mnistTrain.reset();
+    model.fit(mnistTrain);
+    println("Fitting set entropy: " + model.score());
+    mnistTest.reset();
+    println(model.evaluate(mnistTest));
+    println("Number of parameters:" + model.numParams());
+    println("Model length:" + model.gradient().gradient().length());
+    
+      }
+%sparkdl
+def conf1(para: List[Int], seed: Int, nChannels: Int, outputNum: Int, mnistTrain : DataSetIterator,  mnistTest : DataSetIterator){
+    val conf = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(para(0), para(0))
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(para(1), para(1))
+                        .nOut(para(2))
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(para(3),para(3))
+                        .stride(para(4),para(4))
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(para(5), para(5))
+                        //Note that nIn need not be specified in later layers
+                        .stride(para(6), para(6))
+                        .nOut(para(7))
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(para(8),para(8))
+                        .stride(para(9),para(9))
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(para(10)).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+    modelmetric(conf, mnistTrain, mnistTest);
+}
+%sparkdl
+val paraList1 = List(5,1,20,2,2,5,1,20,2,2,20)
+val paraList2 = List(5,1,10,2,2,5,1,10,2,2,10)
+val paraList3 = List(5,1,5,2,2,5,1,5,2,2,5)
+val paraList4 = List(7,1,5,2,2,3,1,5,2,2,5)
+val paraList5 = List(7,1,5,2,1,3,1,5,2,1,5)
+val paraList6 = List(3,1,5,2,1,3,1,5,2,1,3)
+val paraList7 = List(3,1,7,2,1,3,1,5,2,1,5)
+val paraList8 = List(3,1,5,2,1,3,1,5,2,1,4)
+val paraList9 = List(5,2,10,2,2,5,1,10,2,2,10)
+val paraList10 = List(7,1,5,2,2,3,1,10,2,2,10)
+val paraAll = List(paraList1, paraList2, paraList3, paraList4, paraList5, paraList6, paraList7, paraList8, paraList9, paraList10)
+for (p<- paraAll){
+    conf1(p, seed, nChannels, outputNum, mnistTrain, mnistTest);
+}
+%sparkdl
+val confRELUMAX : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.RELU)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.RELU)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+
+%sparkdl
+
+modelmetric(confRELUMAX, mnistTrain, mnistTest);
+%sparkdl
+val confRELUAVG : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.RELU)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.RELU)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+%sparkdl
+modelmetric(confRELUAVG, mnistTrain, mnistTest);
+%sparkdl
+val confSIGMMAX : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.SIGMOID)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.SIGMOID)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.SIGMOID)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+%sparkdl
+modelmetric(confSIGMMAX, mnistTrain, mnistTest);
+%sparkdl
+val confSIGMAVG : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.SIGMOID)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.SIGMOID)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.SIGMOID)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+%sparkdl
+modelmetric(confSIGMAVG, mnistTrain, mnistTest);
+%sparkdl
+val confTANHMAX : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.TANH)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+%sparkdl
+modelmetric(confTANHMAX, mnistTrain, mnistTest);
+%sparkdl
+val confTANHAVG : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.AVG)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.TANH)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+%sparkdl
+modelmetric(confTANHAVG, mnistTrain, mnistTest);
+%sparkdl
+// Runtime compare
+// My smallest model
+val t0 = System.nanoTime
+val conf : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(7, 7)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(5)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(3, 3)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(10)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(10).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+modelmetric(conf, mnistTrain, mnistTest);
+val duration0 = (System.nanoTime - t0) / 1e6d
+println("My smallest model runtime in ms:" +duration0)
+
+// Baselin Model
+// val t1 = System.nanoTime
+// val conf0 : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+//                 .seed(seed)
+//                 .l2(0.0005)
+//                 .weightInit(WeightInit.XAVIER)
+//                 .updater(new Nesterovs(0.01, 0.9))
+//                 .list()
+//                 .layer(0, new ConvolutionLayer.Builder(5, 5)
+//                         //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+//                         .nIn(nChannels)
+//                         .stride(1, 1)
+//                         .nOut(20)
+//                         .activation(Activation.IDENTITY)
+//                         .build())
+//                 .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+//                         .kernelSize(2,2)
+//                         .stride(2,2)
+//                         .build())
+//                 .layer(2, new ConvolutionLayer.Builder(5, 5)
+//                         //Note that nIn need not be specified in later layers
+//                         .stride(1, 1)
+//                         .nOut(50)
+//                         .activation(Activation.IDENTITY)
+//                         .build())
+//                 .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+//                         .kernelSize(2,2)
+//                         .stride(2,2)
+//                         .build())
+//                 .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+//                         .nOut(50).build())
+//                 .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+//                         .nOut(outputNum)
+//                         .activation(Activation.SOFTMAX)
+//                         .build())
+//                 .setInputType(InputType.convolutionalFlat(28,28,1))
+//                 .build());
+// val duration1 = (System.nanoTime - t1) / 1e6d
+// println("Baseline model runtime in ms:" +duration1)
+%sparkdl
+// Baselin Model
+val t1 = System.nanoTime
+val conf0 : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(5, 5)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(20)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(5, 5)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(50)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(50).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1))
+                .build());
+modelmetric(conf0, mnistTrain, mnistTest);
+val duration1 = (System.nanoTime - t1) / 1e6d
+println("Baseline model runtime in ms:" +duration1)
+%sparkdl
+val model = new MultiLayerNetwork(conf);
+model.init();
+mnistTrain.reset();
+model.fit(mnistTrain);
+println("Fitting set entropy: " + model.score());
+mnistTest.reset();
+println(model.evaluate(mnistTest));
+%sparkdl
+val model1a = new MultiLayerNetwork(conf);
+model1a.init();
+mnistTrain.reset();
+model1a.fit(mnistTrain);
+println("Fitting set entropy: " + model1a.score());
+mnistTest.reset();
+println(model1a.evaluate(mnistTest));
+%sparkdl
+
+
+val conf2 : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(5, 5)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(20)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(5, 5)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(50)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(40).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1)) //See note below
+                .build());
+%sparkdl
+val model2 = new MultiLayerNetwork(conf2);
+model2.init();
+mnistTrain.reset();
+model2.fit(mnistTrain);
+println("Fitting set entropy: " + model2.score());
+mnistTest.reset();
+println(model2.evaluate(mnistTest));
+%sparkdl
+
+val conf3 : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(5, 5)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(20)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(5, 5)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(50)
+                        .activation(Activation.IDENTITY)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(60).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1)) //See note below
+                .build());   
+
+%sparkdl
+
+val model3 = new MultiLayerNetwork(conf3);
+model3.init();
+mnistTrain.reset();
+model3.fit(mnistTrain);
+println("Fitting set entropy: " + model3.score());
+mnistTest.reset();
+println(model3.evaluate(mnistTest));
+%sparkdl
+val conf4 : MultiLayerConfiguration = (new NeuralNetConfiguration.Builder()
+                .seed(seed)
+                .l2(0.0005)
+                .weightInit(WeightInit.XAVIER)
+                .updater(new Nesterovs(0.01, 0.9))
+                .list()
+                .layer(0, new ConvolutionLayer.Builder(5, 5)
+                        //nIn and nOut specify depth. nIn here is the nChannels and nOut is the number of filters to be applied
+                        .nIn(nChannels)
+                        .stride(1, 1)
+                        .nOut(20)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(1, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(2, new ConvolutionLayer.Builder(5, 5)
+                        //Note that nIn need not be specified in later layers
+                        .stride(1, 1)
+                        .nOut(50)
+                        .activation(Activation.TANH)
+                        .build())
+                .layer(3, new SubsamplingLayer.Builder(PoolingType.MAX)
+                        .kernelSize(2,2)
+                        .stride(2,2)
+                        .build())
+                .layer(4, new DenseLayer.Builder().activation(Activation.RELU)
+                        .nOut(40).build())
+                .layer(5, new OutputLayer.Builder(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
+                        .nOut(outputNum)
+                        .activation(Activation.SOFTMAX)
+                        .build())
+                .setInputType(InputType.convolutionalFlat(28,28,1)) //See note below
+                .build());   
+%sparkdl
+
+
+val model4 = new MultiLayerNetwork(conf4);
+model4.init();
+mnistTrain.reset();
+model4.fit(mnistTrain);
+println("Fitting set entropy: " + model4.score());
+mnistTest.reset();
+println(model4.evaluate(mnistTest));
+%sparkdl
+
+// Calculate the model size.
+model4.gradient().gradient().length()
+
+
+## END
