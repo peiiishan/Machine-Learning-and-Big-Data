@@ -12,4 +12,4 @@ In this assignment, we generate word2vec model which can perform the following t
 Task 1: Try to make the (king) - (man) + (woman) produce queen with as high of a similarity
 score as possible<br />
 Task 2: Try to find a pair of synonyms with extremely high similarity score.<br />
-Task3: Try to find two words that are antonyms.<br />
+Task 3: Try to find two words that are antonyms.<br />
