@@ -1,0 +1,166 @@
+%spark
+
+import org.apache.spark.SparkContext
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.ml.linalg.DenseVector
+import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.functions.rand
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
+import scala.collection.JavaConversions._
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.ml.feature.Word2Vec
+import org.apache.spark.ml.feature.Word2VecModel
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.sql.Row
+import org.apache.spark.storage.StorageLevel
+
+println("Scala version: " + util.Properties.versionString);
+println("Spark version: " + sc.version);
+println("Java version: " + System.getProperty("java.version"));
+# What follows is a simple (far too simple to be useful) example of Word2Vec
+%spark
+
+
+// Input data: Each row is a bag of words from a sentence or document.
+val documentDF = spark.createDataFrame(Seq(
+  "Hi I heard about Spark".split(" "),
+  "I wish Java could use case classes".split(" "),
+  "Logistic regression models are neat".split(" ")
+).map(Tuple1.apply)).toDF("text")
+
+// Learn a mapping from words to Vectors.
+val word2Vec = new Word2Vec()
+  .setInputCol("text")
+  .setOutputCol("result")
+  .setVectorSize(3)
+  .setMinCount(0)
+val model = word2Vec.fit(documentDF)
+
+val result = model.transform(documentDF)
+result.collect().foreach { case Row(text: Seq[_], features: Vector) =>
+  println(s"Text: [${text.mkString(", ")}] => \nVector: $features\n") }
+# Helper functions. 
+%spark
+def splitFunc (textLine: String) : Array[String] = {return textLine.toLowerCase.split(" ");}
+val splitUdf = udf(splitFunc _)
+
+def ExtractVector(word: String, model: Word2VecModel) : Array[Double] = {return model.getVectors.filter($"word" === word).select("vector").collect().apply(0).apply(0).asInstanceOf[DenseVector].toArray;}; 
+
+def VectorPlus(a : Array[Double], b: Array[Double]) : Array[Double] = { return a.zip(b).map(x => x._1 + x._2); };
+def VectorMinus(a : Array[Double], b: Array[Double]) : Array[Double] = { return a.zip(b).map(x => x._1 - x._2); };
+# Read clean text
+%spark
+var raw_text_sample : DataFrame =  spark.read.parquet("gs://fregy-9733-2022h2-spark//gutenberg_sample").withColumn("text2", splitUdf($"clean_text")).orderBy(rand()).limit(1000 * 1000);
+raw_text_sample.createOrReplaceTempView("raw_text_sample")
+
+raw_text_sample.count();
+
+//var df_shuffled_orig = df_tmp2.sample(true, 0.005);
+//df_shuffled_orig.write.mode("append").format("parquet").save("<filename>");
+// var df_shuffled = spark.read.parquet("<path>/gutenberg_sample")
+// df_shuffled.count()
+%sql
+
+SELECT *
+FROM raw_text_sample
+LIMIT 10
+# Baseline model - train a very small model, and see how it is doing.
+%spark
+
+var start = System.currentTimeMillis();
+val word2Vec = new Word2Vec()
+  .setInputCol("text2")
+  .setOutputCol("result")
+  .setVectorSize(8)
+  .setMinCount(0)
+val model = word2Vec.fit(raw_text_sample.limit(5 * 1000))
+var end = System.currentTimeMillis();
+
+println("Fitting time: " + (end - start))
+
+z.show(model.findSynonyms("man", 5));
+
+//model.save("<filename>")
+## The results are not good, we need to do better. 
+%spark
+println("Vector Count: " + model.getVectors.count())
+%spark
+z.show(model.findSynonyms("palace", 5))
+# Let's try a larger model, but not too large. 
+%spark
+var start = System.currentTimeMillis();
+val word2Vec2 = new Word2Vec()
+  .setInputCol("text2")
+  .setOutputCol("result")
+  .setVectorSize(128)
+  .setMinCount(5)
+val model2 = word2Vec2.fit(raw_text_sample.limit(200 * 1000))
+var end = System.currentTimeMillis();
+
+println("Fitting time: " + (end - start))
+// Test the model and compare it with model 1 
+z.show(model2.findSynonyms("man", 5));
+%spark
+//var output_vector = VectorMinus(ExtractVector("boy", model2), ExtractVector("man", model2));
+var output_vector = VectorPlus(ExtractVector("child", model2), ExtractVector("woman", model2));
+z.show(model2.findSynonyms(Vectors.dense(output_vector), 5))
+
+# Much Better!
+
+## Still a little strange, but mostly OK, especially for the top few results. 
+
+ 
+# Build our Word2Vec model
+try to get a better result
+%spark
+// Reference doc: https://spark.apache.org/docs/3.1.1/api/scala/org/apache/spark/ml/feature/Word2Vec.html
+var start = System.currentTimeMillis();
+val word2Vec3 = new Word2Vec()
+  .setInputCol("text2")
+  .setOutputCol("result")
+  .setVectorSize(64)
+  .setMinCount(3)
+   .setWindowSize(8)
+//   .setStepSize(5)
+val model3 = word2Vec3.fit(raw_text_sample)
+var end = System.currentTimeMillis();
+
+println("Fitting time: " + (end - start))
+%spark
+z.show(model3.findSynonyms("man", 10));
+%spark
+var output_vector = VectorPlus(ExtractVector("child", model3), ExtractVector("woman", model3));
+z.show(model3.findSynonyms(Vectors.dense(output_vector), 10))
+
+## Now let's try some embedding arithmetic. 
+
+We assume that something like "boy" - "man" would be "child", or some other gender neutral notion. Let's see.
+# This one didn't work, but maybe it could have with a better model. 
+
+Your goal is to make "king" - "man" + "woman" have "queen" as its top synonym (or one of the top few). 
+
+# Task 1: Try to make the king - man + woman produce "queen" with high similarity
+%spark
+// Baseline model 2, compare our model with this one
+var output_vector = VectorPlus(VectorMinus(ExtractVector("king", model2), ExtractVector("man", model2)),  ExtractVector("woman", model2));
+z.show(model2.findSynonyms(Vectors.dense(output_vector), 5))
+%spark
+var output_vector = VectorPlus(VectorMinus(ExtractVector("king", model3), ExtractVector("man", model3)),  ExtractVector("woman", model3));
+z.show(model3.findSynonyms(Vectors.dense(output_vector), 10))
+# Task 2: Try to find a pair of synonyms with extremely high similarity score
+%spark
+z.show(model2.findSynonyms("king", 5));
+%spark
+z.show(model3.findSynonyms("king", 5));
+%spark
+z.show(model3.findSynonyms("dinner", 5));
+# Task 3: Try to find two words that are antonyms (e.g. good and bad), but have a very high similarity score.
+%spark
+z.show(model3.findSynonyms("up", 5));
+%spark
+
+%spark
