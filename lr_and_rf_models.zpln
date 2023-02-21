@@ -1,0 +1,519 @@
+
+## Now do all the imports to set up the code we will use later. 
+%spark
+
+import org.apache.spark.SparkContext
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.classification.LogisticRegressionModel
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.feature.StandardScaler
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.ml.linalg.DenseVector
+import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.functions
+import org.apache.spark.sql.types.BooleanType;
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
+import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
+import org.apache.spark.storage.StorageLevel
+import scala.collection.immutable.TreeSet;
+import scala.collection.mutable.SortedSet;
+import scala.collection.GenSeq;
+
+import scala.collection.mutable.ListBuffer;
+import org.apache.spark.ml.PipelineModel;
+import org.apache.spark.ml.PipelineStage;
+import org.apache.spark.ml.Pipeline;
+import org.apache.spark.ml.feature.OneHotEncoder;
+import org.apache.spark.ml.feature.StringIndexer;
+import org.apache.spark.ml.feature.StringIndexerModel;
+import org.apache.spark.ml.linalg.Vector;
+
+import org.apache.spark.ml.classification.ProbabilisticClassificationModel;
+import org.apache.spark.ml.classification.ProbabilisticClassifier;
+
+
+
+## print versions
+%spark
+
+// Print versions.
+
+println("Scala version: " + util.Properties.versionString);
+println("Spark version: " + sc.version);
+println("Java version: " + System.getProperty("java.version"))
+## Assemble functions to be used later. 
+
+%spark
+
+val b2d = (x:Boolean) => if(x) 1.0 else 0.0
+val b2dUdf = udf(b2d);
+
+def filterData (raw : DataFrame) : DataFrame = {
+    var df_filtered = raw.filter($"MTM_LTV" > 0.0).filter($"MTM_LTV" < 2.0);
+    df_filtered = df_filtered.filter($"INCENTIVE" > -1.0).filter($"CREDIT_SCORE" > 0);
+    df_filtered = df_filtered.filter($"NEXT_STATUS" >= 0).filter($"NEXT_STATUS" <= 2);
+    df_filtered = df_filtered.filter($"AGE" >= 0).filter($"STATUS" === 1);
+    df_filtered = df_filtered.filter($"TERM" >= 0);
+    df_filtered = df_filtered.filter($"MI_PERCENT" >= 0);
+    df_filtered = df_filtered.filter($"UNIT_COUNT" >= 0);
+    df_filtered = df_filtered.filter($"ORIG_LTV" >= 0);
+    df_filtered = df_filtered.filter($"ORIG_CLTV" >= 0);
+    df_filtered = df_filtered.filter($"ORIG_DTI" >= 0);
+    df_filtered = df_filtered.filter($"ORIG_UPB" >= 0);
+    df_filtered = df_filtered.filter($"ORIG_INTRATE" >= 0);
+    
+    // Go ahead and add the status columns here. 
+    df_filtered = df_filtered.withColumn("actual_p", expr(" case when next_status = 0 then 1.0 else 0.0 end"));
+    df_filtered = df_filtered.withColumn("actual_c", expr(" case when next_status = 1 then 1.0 else 0.0 end"));
+    df_filtered = df_filtered.withColumn("actual_3", expr(" case when next_status = 2 then 1.0 else 0.0 end"));
+    
+    return df_filtered;
+};
+
+def convertBoolColumns(data: DataFrame, enumColumns: Array[String]) : DataFrame = {
+    var d2 = data;
+    val type_map = data.dtypes.groupBy(_._1).map { case (k,v) => (k,v.map(_._2))};
+    
+    for(cname <- enumColumns) {
+        if(type_map(cname)(0).equals("BooleanType")) {
+            // We need to convert this to a string type. 
+            d2 = d2.withColumn(cname, b2dUdf(col(cname))); 
+        }
+    }
+    
+    return d2;
+}
+
+    
+%spark
+
+
+// This function generates the appropriate encoders for a dataframe. 
+def generateEncoders(data: DataFrame, enumColumns: Array[String]) : PipelineModel = {
+    val indexCols = enumColumns.map((s:String) => s + "_Index")
+    val vecCols = enumColumns.map((s:String) => s + "_Vec")
+    var stages  = new ListBuffer[PipelineStage]();
+    
+    for(i <- 0 to indexCols.length - 1) {
+        val strCol = enumColumns(i);
+        val indexCol = indexCols(i);
+        val vecCol = vecCols(i);
+
+        
+        var indexer = new StringIndexer().setInputCol(strCol).setOutputCol(indexCol)
+        .setStringOrderType("frequencyAsc");
+        stages.append(indexer);
+    }
+    
+    var onehot = new OneHotEncoder().setInputCols(indexCols).setOutputCols(vecCols).setDropLast(true);
+    stages.append(onehot);
+    
+    val pipeline = new Pipeline()
+        .setStages(stages.toArray)
+    
+    return pipeline.fit(data);
+}
+
+
+def applyEncoders(data: DataFrame, model: PipelineModel, binaryCols : ListBuffer[String]) : DataFrame = {
+    binaryCols.clear();
+    var df_output = model.transform(data);
+    
+    val vToA: Any => Array[Double] = _.asInstanceOf[Vector].toArray
+    val vToAUdf = udf(vToA);
+    
+    
+    for(next <- model.stages) {
+        if(next.isInstanceOf[StringIndexerModel]) {
+            // Add a column for each potential value. 
+            var indexer = next.asInstanceOf[StringIndexerModel]
+            val labels = indexer.labels;
+            val inputCol = indexer.getInputCol;
+            
+            for(i <- 0 to labels.length - 2) {
+                val labelName = labels(i).replaceAll("[^a-zA-Z0-9_]", "_");
+                val colName = (inputCol + "_" + labelName);
+                
+                df_output = df_output.withColumn(colName, element_at(vToAUdf(col(inputCol + "_Vec")), 1 + i))
+                binaryCols += colName;
+            }
+        }
+    }
+    
+    return df_output;
+    }
+
+%spark
+
+import org.apache.spark.ml.functions.vector_to_array
+import org.apache.spark.ml.Estimator
+
+// Super ugly. The Probability array is a DenseVector, and basically none of the functions work on it. 
+def convertProbArray (raw : DataFrame, table_name : String) : DataFrame = {
+    return raw.withColumn("prob_array",vector_to_array(functions.col("probability")));
+};
+
+def expandColumns (raw : DataFrame, table_name : String) : DataFrame = {
+    var expanded = convertProbArray(raw, table_name);
+    
+    val distEntropy = (x: GenSeq[Double]) => {
+        var sum = 0.0;
+        
+        for(next <- x) {
+            if(next > 0) {
+                sum = sum + (next*Math.log(next))
+            }
+        }
+        
+         -1.0 * sum    
+    }
+    
+    val deUdf = udf(distEntropy)
+    
+    // Now split out the probabilities.
+    expanded = expanded.withColumn("prob_p", element_at($"prob_array", 1)).withColumn("prob_c",element_at($"prob_array", 2)).withColumn("prob_3", element_at($"prob_array", 3));
+    expanded = expanded.withColumn("h_g", deUdf(col("prob_array")));
+    expanded = expanded.withColumn("h_fg", expr(" -1.0 * log(prob_array[next_status])"));
+    expanded = expanded.withColumn("table_name", functions.lit(table_name));
+
+    expanded.registerTempTable(table_name);
+    return expanded;
+};
+
+def testClassifier (df_test : DataFrame, model : PipelineModel, tableName: String) : DataFrame = {
+    return expandColumns(model.transform(df_test),tableName);
+}
+
+
+%spark
+
+def generateAssembler(data: DataFrame, featureCols: Array[String]) : PipelineModel = {
+    var features = SortedSet[String]()
+    
+    for(next <- featureCols) {
+        if(data.columns.contains(next)) {
+            features += next;
+        }
+        else if(data.columns.contains(next + "_Vec")) {
+            features += (next + "_Vec");
+        }
+        else {
+            throw new IllegalArgumentException("Invalid column: " + next);
+        }
+    }
+
+    val assembler = new VectorAssembler().
+      setInputCols(features.toArray).
+      setOutputCol("features")
+    
+    val scaler = new StandardScaler()
+      .setInputCol("features")
+      .setOutputCol("scaledFeatures")
+      .setWithStd(true)
+      .setWithMean(true)
+
+    val pipeline = new Pipeline()
+        .setStages(Array[PipelineStage](assembler, scaler));
+    
+    return pipeline.fit(data); 
+}
+
+
+
+%spark
+
+val enumCols = SortedSet[String]() ++ Array("OCCUPANCY_STATUS", "FIRSTTIME_BUYER", "TERM", "UNIT_COUNT", "PREPAYMENT_PENALTY")
+val numericCols = SortedSet[String]() ++ Array("AGE", "MTM_LTV", "INCENTIVE", "CREDIT_SCORE", "MI_PERCENT", "ORIG_CLTV", "ORIG_DTI", "ORIG_UPB", "ORIG_INTRATE")
+
+var df_raw : DataFrame = convertBoolColumns(filterData(spark.read.parquet("/Users/peishanliu/Desktop/9733BD/9733twrepo/fregy-9733-w2/data/df_c_1")), enumCols.toArray)
+df_raw.registerTempTable("df_raw")
+
+var binaryCols = new ListBuffer[String]();
+var pipeline = generateEncoders(df_raw, enumCols.toArray);
+df_raw = applyEncoders(df_raw, pipeline, binaryCols);
+
+println("Cols: " + binaryCols)
+
+
+%sql 
+select age, count(1) AS value
+from df_raw
+group by age
+order by age
+## Prepare the data
+
+%spark
+
+// For now, just allow all features. 
+val featureList = Array("OCCUPANCY_STATUS", "FIRSTTIME_BUYER", "TERM", "UNIT_COUNT", "PREPAYMENT_PENALTY", "AGE", "MTM_LTV", "INCENTIVE", "CREDIT_SCORE", "MI_PERCENT", "ORIG_CLTV", "ORIG_DTI", "ORIG_UPB", "ORIG_INTRATE");
+val fittingSample : Int = 500 * 1000;
+
+val assembler = generateAssembler(df_raw, featureList);
+//val df_assembled = assembler.transform(df_raw);
+
+// Split these, allocating about 500k observations for training. 
+var Array(df_train, df_test) = df_raw.randomSplit(Array(0.25, 0.75), seed= 12345);
+
+// Randomize the order of the training data. 
+// This is small enough that we can pretty easily cache the whole thing.
+df_train = df_train.orderBy(rand()).persist();
+
+## Fit LR and RF Models
+
+%spark 
+
+def generate_summary(df_test : DataFrame, model : PipelineModel, tableName: String) : DataFrame = {
+    val results = testClassifier(df_test, model,tableName);
+    val summary = results.groupBy("table_name").agg(
+        functions.count("*").as("count"), functions.avg("h_g").as("distEntropy"), functions.avg("h_fg").as("h_fg"), 
+        functions.avg("prob_p").as("prob_p"), functions.avg("prob_c").as("prob_c"), functions.avg("prob_3").as("prob_3"), 
+        functions.avg("actual_p").as("actual_p"), functions.avg("actual_c").as("actual_c"), functions.avg("actual_3").as("actual_3")
+        )
+    
+    return summary
+}
+
+def summarize_assembled(df_train : DataFrame, df_test: DataFrame, model : PipelineModel, tableName: String) : DataFrame = {
+    val train_summary = generate_summary(df_train, model, tableName + "_train")
+    val test_summary = generate_summary(df_test, model, tableName + "_test")
+    val output = train_summary.union(test_summary).persist();
+    return output
+}
+
+
+%spark
+// Experiment 1(Default)
+var lr_classifier1 = new LogisticRegression().setMaxIter(100).setRegParam(0.001).setElasticNetParam(0.001)
+lr_classifier1 = lr_classifier1.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline1 = new Pipeline().setStages(Array(assembler, lr_classifier1))
+var lrModel1 = lr_pipeline1.fit(df_train.limit(fittingSample))
+
+%spark
+
+var rf_classifier1 = new RandomForestClassifier().setSeed(12345).setNumTrees(12).setMaxDepth(10)
+rf_classifier1 = rf_classifier1.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline1 = new Pipeline().setStages(Array(assembler, rf_classifier1))
+var rf_model1 = rf_pipeline1.fit(df_train.limit(fittingSample))
+%spark
+
+// var featureList = Array("OCCUPANCY_STATUS", "FIRSTTIME_BUYER", "TERM", "UNIT_COUNT", "PREPAYMENT_PENALTY", "AGE", "MTM_LTV", "INCENTIVE", "CREDIT_SCORE", "MI_PERCENT", "ORIG_CLTV", "ORIG_DTI", "ORIG_UPB", "ORIG_INTRATE");
+var rf_insample1 = testClassifier(df_train.limit(fittingSample), rf_model1,"rf_insample1");
+var lr_insample1 = testClassifier(df_train.limit(fittingSample), lrModel1,"lr_insample1");
+var rf_indist1 = testClassifier(df_test, rf_model1,"rf_indist1");
+var lr_indist1 = testClassifier(df_test, lrModel1,"lr_indist1");
+
+
+var df_combined1 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel1, "base_lr1")
+df_combined1 = df_combined1.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model1, "base_rf1"))
+
+// df_combined = df_combined.persist()
+// df_combined.createOrReplaceTempView("df_combined")
+// z.show(df_combined)
+%spark
+
+
+
+df_combined1 = df_combined1.persist()
+df_combined1.createOrReplaceTempView("df_combined1")
+z.show(df_combined1)
+%spark
+// Experiment2
+var lr_classifier2 = new LogisticRegression().setMaxIter(100).setRegParam(0.01).setElasticNetParam(0.001)
+lr_classifier2 = lr_classifier2.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline2 = new Pipeline().setStages(Array(assembler, lr_classifier2))
+var lrModel2 = lr_pipeline2.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier2 = new RandomForestClassifier().setSeed(12345).setNumTrees(10).setMaxDepth(10)
+rf_classifier2 = rf_classifier2.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline2 = new Pipeline().setStages(Array(assembler, rf_classifier2))
+var rf_model2 = rf_pipeline2.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample2 = testClassifier(df_train.limit(fittingSample), rf_model2,"rf_insample2");
+var lr_insample2 = testClassifier(df_train.limit(fittingSample), lrModel2,"lr_insample2");
+var rf_indist2 = testClassifier(df_test, rf_model2,"rf_indist2");
+var lr_indist2 = testClassifier(df_test, lrModel2,"lr_indist2");
+
+
+var df_combined2 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel2, "base_lr2")
+df_combined2 = df_combined2.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model2, "base_rf2"))
+%spark
+df_combined2 = df_combined2.persist()
+df_combined2.createOrReplaceTempView("df_combined2")
+z.show(df_combined2)
+%spark
+// Experiment3
+var lr_classifier3 = new LogisticRegression().setMaxIter(200).setRegParam(0.001).setElasticNetParam(0.001)
+lr_classifier3 = lr_classifier3.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline3 = new Pipeline().setStages(Array(assembler, lr_classifier3))
+var lrModel3 = lr_pipeline3.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier3 = new RandomForestClassifier().setSeed(12345).setNumTrees(14).setMaxDepth(10)
+rf_classifier3 = rf_classifier3.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline3 = new Pipeline().setStages(Array(assembler, rf_classifier3))
+var rf_model3 = rf_pipeline3.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample3 = testClassifier(df_train.limit(fittingSample), rf_model3,"rf_insample3");
+var lr_insample3 = testClassifier(df_train.limit(fittingSample), lrModel3,"lr_insample3");
+var rf_indist3 = testClassifier(df_test, rf_model3,"rf_indist3");
+var lr_indist3 = testClassifier(df_test, lrModel3,"lr_indist3");
+
+
+var df_combined3 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel3, "base_lr3")
+df_combined3 = df_combined3.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model3, "base_rf3"))
+%spark
+df_combined3 = df_combined3.persist()
+df_combined3.createOrReplaceTempView("df_combined3")
+z.show(df_combined3)
+%spark
+
+%spark
+// Experiment4
+var lr_classifier4 = new LogisticRegression().setMaxIter(200).setRegParam(0.001).setElasticNetParam(0.01)
+lr_classifier4 = lr_classifier4.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline4 = new Pipeline().setStages(Array(assembler, lr_classifier4))
+var lrModel4 = lr_pipeline4.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier4 = new RandomForestClassifier().setSeed(12345).setNumTrees(14).setMaxDepth(12)
+rf_classifier4 = rf_classifier4.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline4 = new Pipeline().setStages(Array(assembler, rf_classifier4))
+var rf_model4 = rf_pipeline4.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample4 = testClassifier(df_train.limit(fittingSample), rf_model4,"rf_insample4");
+var lr_insample4 = testClassifier(df_train.limit(fittingSample), lrModel4,"lr_insample4");
+var rf_indist4 = testClassifier(df_test, rf_model4,"rf_indist4");
+var lr_indist4 = testClassifier(df_test, lrModel4,"lr_indist4");
+
+
+var df_combined4 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel4, "base_lr4")
+df_combined4 = df_combined4.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model4, "base_rf4"))
+%spark
+df_combined4 = df_combined4.persist()
+df_combined4.createOrReplaceTempView("df_combined4")
+z.show(df_combined4)
+%spark
+
+%spark
+// Experiment5
+var lr_classifier5 = new LogisticRegression().setMaxIter(80).setRegParam(0.001).setElasticNetParam(0.001)
+lr_classifier5 = lr_classifier5.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline5 = new Pipeline().setStages(Array(assembler, lr_classifier5))
+var lrModel5 = lr_pipeline5.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier5 = new RandomForestClassifier().setSeed(12345).setNumTrees(14).setMaxDepth(8)
+rf_classifier5 = rf_classifier5.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline5 = new Pipeline().setStages(Array(assembler, rf_classifier5))
+var rf_model5 = rf_pipeline5.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample5 = testClassifier(df_train.limit(fittingSample), rf_model5,"rf_insample5");
+var lr_insample5 = testClassifier(df_train.limit(fittingSample), lrModel5,"lr_insample5");
+var rf_indist5 = testClassifier(df_test, rf_model5,"rf_indist5");
+var lr_indist5 = testClassifier(df_test, lrModel5,"lr_indist5");
+
+
+var df_combined5 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel5, "base_lr5")
+df_combined5 = df_combined5.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model5, "base_rf5"))
+%spark
+df_combined5 = df_combined5.persist()
+df_combined5.createOrReplaceTempView("df_combined5")
+z.show(df_combined5)
+%spark
+
+%spark
+
+%spark
+// Experiment6
+var lr_classifier6 = new LogisticRegression().setMaxIter(100).setRegParam(0.0001).setElasticNetParam(0.001)
+lr_classifier6 = lr_classifier6.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline6 = new Pipeline().setStages(Array(assembler, lr_classifier6))
+var lrModel6 = lr_pipeline6.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier6 = new RandomForestClassifier().setSeed(12345).setNumTrees(16).setMaxDepth(10)
+rf_classifier6 = rf_classifier6.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline6 = new Pipeline().setStages(Array(assembler, rf_classifier6))
+var rf_model6 = rf_pipeline6.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample6 = testClassifier(df_train.limit(fittingSample), rf_model6,"rf_insample6");
+var lr_insample6 = testClassifier(df_train.limit(fittingSample), lrModel6,"lr_insample6");
+var rf_indist6 = testClassifier(df_test, rf_model6,"rf_indist6");
+var lr_indist6 = testClassifier(df_test, lrModel6,"lr_indist6");
+
+
+var df_combined6 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel6, "base_lr6")
+df_combined6 = df_combined6.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model6, "base_rf6"))
+%spark
+df_combined6 = df_combined6.persist()
+df_combined6.createOrReplaceTempView("df_combined6")
+z.show(df_combined6)
+%spark
+
+%spark
+// Experiment7
+var lr_classifier7 = new LogisticRegression().setMaxIter(100).setRegParam(0.0001).setElasticNetParam(0.0005)
+lr_classifier7 = lr_classifier7.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline7 = new Pipeline().setStages(Array(assembler, lr_classifier7))
+var lrModel7 = lr_pipeline7.fit(df_train.limit(fittingSample))
+%spark
+var rf_classifier7 = new RandomForestClassifier().setSeed(12345).setNumTrees(14).setMaxDepth(14)
+rf_classifier7 = rf_classifier7.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline7 = new Pipeline().setStages(Array(assembler, rf_classifier7))
+var rf_model7 = rf_pipeline7.fit(df_train.limit(fittingSample))
+%spark
+var rf_insample7 = testClassifier(df_train.limit(fittingSample), rf_model7,"rf_insample7");
+var lr_insample7 = testClassifier(df_train.limit(fittingSample), lrModel7,"lr_insample7");
+var rf_indist7 = testClassifier(df_test, rf_model7,"rf_indist7");
+var lr_indist7 = testClassifier(df_test, lrModel7,"lr_indist7");
+
+
+var df_combined7 = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel7, "base_lr7")
+df_combined7 = df_combined7.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model7, "base_rf7"))
+%spark
+df_combined7 = df_combined7.persist()
+df_combined7.createOrReplaceTempView("df_combined7")
+z.show(df_combined7)
+%spark
+// Best Models from Previous Experiments
+var lr_classifier = new LogisticRegression().setMaxIter(100).setRegParam(0.0001).setElasticNetParam(0.0005)
+lr_classifier = lr_classifier.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var lr_pipeline = new Pipeline().setStages(Array(assembler, lr_classifier))
+var lrModel = lr_pipeline.fit(df_train.limit(fittingSample))
+lrModel.save("BestlrModel_PeishanLiu_RongCao")
+%spark
+
+var rf_classifier = new RandomForestClassifier().setSeed(12345).setNumTrees(14).setMaxDepth(12)
+rf_classifier = rf_classifier.setLabelCol("NEXT_STATUS").setFeaturesCol("scaledFeatures")
+var rf_pipeline = new Pipeline().setStages(Array(assembler, rf_classifier))
+var rf_model = rf_pipeline.fit(df_train.limit(fittingSample))
+rf_model.save("BestrfModel_PeishanLiu_RongCao")
+%spark
+var rf_insample = testClassifier(df_train.limit(fittingSample), rf_model,"rf_insample");
+var lr_insample = testClassifier(df_train.limit(fittingSample), lrModel,"lr_insample");
+var rf_indist = testClassifier(df_test, rf_model,"rf_indist");
+var lr_indist = testClassifier(df_test, lrModel,"lr_indist");
+
+
+var df_combined = summarize_assembled(df_train.limit(fittingSample), df_test, lrModel, "base_lr")
+df_combined = df_combined.union(summarize_assembled(df_train.limit(fittingSample), df_test, rf_model, "base_rf"))
+%spark
+df_combined = df_combined.persist()
+df_combined.createOrReplaceTempView("df_combined")
+z.show(df_combined)
+## Now apply the models to the various datasets, and analyze the results. 
+
+%sql
+
+SELECT age, sum(prob_c), sum(prob_p), sum(prob_3), sum(actual_c), sum(actual_p), sum(actual_3), sum(h_g), sum(h_fg)
+FROM rf_insample
+GROUP BY age
+ORDER BY age
+
+%sql
+
+SELECT age, sum(prob_c), sum(prob_p), sum(prob_3), sum(actual_c), sum(actual_p), sum(actual_3), sum(h_g), sum(h_fg)
+FROM lr_insample
+GROUP BY age
+ORDER BY age
+
+### END
